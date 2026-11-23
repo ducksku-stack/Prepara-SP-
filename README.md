@@ -1,1 +1,1 @@
-#script de injeção no console feito para o Prepara SP 
+Nao utilize se utilizar o script e se ferrar o problema nao é meu, NAO FORCEI NINGUEM.
