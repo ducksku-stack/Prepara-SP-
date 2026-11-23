@@ -6,37 +6,71 @@
     timeout: 65000,
     confiancaMinima: 70,
     intervalo: 250,
-    tentativas: 45,
-    debounce: 500,
+    tentativasFeedback: 80, // ~20s aguardando botão de avançar/finalizar
+    tentativasTransicao: 80, // ~20s aguardando nova questão
+    debounce: 450,
     maxCache: 200,
+    persistirLocalStorage: true,
     avancarAutomaticamente: true,
     finalizarAutomaticamente: true,
     iniciarProximaAtividade: true,
     intervaloEntreAtividades: 1600
   };
 
-  const estado = {
-    ativo: true,
-    executando: false,
-    avancando: false,
-    navegando: false,
-    ultimaAssinatura: "",
-    assinaturaEmAndamento: "",
-    cacheRespostas: new Map(),
-    observer: null,
-    timer: null,
-    tentativasSemAtividade: 0
-  };
+  const STORAGE_KEY = "__prepara_sp_estado_v2__";
 
   const log = (...a) => console.log("[Prepara SP]", ...a);
   const warn = (...a) => console.warn("[Prepara SP]", ...a);
   const err = (...a) => console.error("[Prepara SP]", ...a);
 
-  const ocupado = () =>
-    !estado.ativo || estado.executando || estado.avancando || estado.navegando;
-
   const esperar = ms => new Promise(r => setTimeout(r, ms));
   const norm = t => (t || "").replace(/\s+/g, " ").trim();
+
+  function carregarEstadoPersistido() {
+    if (!CONFIG.persistirLocalStorage) return { cache: [], ultimaAssinatura: "" };
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return { cache: [], ultimaAssinatura: "" };
+      const parsed = JSON.parse(raw);
+      return {
+        cache: Array.isArray(parsed.cache) ? parsed.cache : [],
+        ultimaAssinatura: typeof parsed.ultimaAssinatura === "string" ? parsed.ultimaAssinatura : ""
+      };
+    } catch {
+      return { cache: [], ultimaAssinatura: "" };
+    }
+  }
+
+  const persistido = carregarEstadoPersistido();
+
+  const estado = {
+    ativo: true,
+    executando: false,
+    avancando: false,
+    navegando: false,
+    ultimaAssinatura: persistido.ultimaAssinatura,
+    assinaturaEmAndamento: "",
+    cacheRespostas: new Map(persistido.cache),
+    observer: null,
+    timer: null,
+    tentativasSemAtividade: 0
+  };
+
+  function salvarEstadoPersistido() {
+    if (!CONFIG.persistirLocalStorage) return;
+    try {
+      const payload = {
+        ultimaAssinatura: estado.ultimaAssinatura,
+        cache: [...estado.cacheRespostas.entries()].slice(-CONFIG.maxCache)
+      };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+    } catch {
+      // Ignora caso localStorage esteja bloqueado ou cheio
+    }
+  }
+
+  const ocupado = () =>
+    !estado.ativo || estado.executando || estado.avancando || estado.navegando;
 
   const visivel = el => {
     if (!el || !el.isConnected) return false;
@@ -49,40 +83,70 @@
   const habilitado = el => {
     if (!el) return false;
     if (el.disabled || el.getAttribute("aria-disabled") === "true") return false;
-    return true;
+    const s = getComputedStyle(el);
+    return s.pointerEvents !== "none";
   };
 
-  const clicarReal = el => {
-    if (!el || !visivel(el) || !habilitado(el)) return false;
+  function dispararEventosClique(alvo) {
+    if (!alvo || !visivel(alvo) || !habilitado(alvo)) return false;
 
-    el.scrollIntoView({
+    alvo.scrollIntoView({
       block: "center",
       behavior: "instant"
     });
 
-    for (const ev of ["pointerdown", "mousedown", "pointerup", "mouseup"]) {
-      const Ctor = ev.startsWith("pointer") ? PointerEvent : MouseEvent;
-      el.dispatchEvent(
-        new Ctor(ev, {
+    const rect = alvo.getBoundingClientRect();
+    const clientX = rect.left + rect.width / 2;
+    const clientY = rect.top + rect.height / 2;
+
+    for (const tipo of ["pointerover", "mouseover", "pointerdown", "mousedown", "pointerup", "mouseup"]) {
+      const Ctor = tipo.startsWith("pointer") ? PointerEvent : MouseEvent;
+      alvo.dispatchEvent(
+        new Ctor(tipo, {
           bubbles: true,
           cancelable: true,
-          composed: true
+          composed: true,
+          clientX,
+          clientY,
+          button: 0
         })
       );
     }
 
-    el.click();
+    alvo.click();
     return true;
+  }
+
+  const clicarReal = el => {
+    if (!el || !visivel(el) || !habilitado(el)) return false;
+
+    // Se o elemento já for interativo, clica direto; senão tenta interno clicável ou o próprio elemento
+    const tag = el.tagName;
+    if (tag === "BUTTON" || tag === "A" || el.getAttribute("role") === "button") {
+      return dispararEventosClique(el);
+    }
+
+    const interno = el.querySelector('button:not([disabled]), [role="button"], label, input[type="radio"], input[type="checkbox"]');
+    if (interno && visivel(interno) && habilitado(interno)) {
+      if (dispararEventosClique(interno)) return true;
+    }
+
+    return dispararEventosClique(el);
   };
 
   const botoes = () =>
     [...document.querySelectorAll(
-      'button[data-slot="button"], a[data-slot="button"], [role="button"], button'
+      'button[data-slot="button"], a[data-slot="button"], [role="button"], button, a'
     )].filter(el => visivel(el) && habilitado(el));
 
   const localizarBotao = texto => {
-    const alvo = texto.toLowerCase();
-    return botoes().find(el => norm(el.textContent).toLowerCase() === alvo);
+    const alvo = norm(texto).toLowerCase();
+    return botoes().find(el => norm(el.innerText || el.textContent).toLowerCase() === alvo);
+  };
+
+  const localizarBotaoConfirmar = () => {
+    const candidatos = ["responder", "confirmar", "verificar", "enviar resposta", "enviar"];
+    return botoes().find(el => candidatos.includes(norm(el.innerText || el.textContent).toLowerCase()));
   };
 
   const obterLinhasCard = el =>
@@ -143,7 +207,7 @@
       .map(el => norm(el.innerText))
       .filter(t =>
         t.length > 5 &&
-        !/^(alternativas|continuar|finalizar|pular|anterior|próxima)$/i.test(t)
+        !/^(alternativas|continuar|finalizar|pular|anterior|próxima|responder|confirmar|verificar)$/i.test(t)
       );
 
     const enunciado = [...new Set([...textosCardsExtras, ...blocosFora])].join("\n");
@@ -169,6 +233,7 @@
       estado.cacheRespostas.delete(maisAntiga);
     }
     estado.cacheRespostas.set(chave, valor);
+    salvarEstadoPersistido();
   }
 
   async function consultarIA(q) {
@@ -213,14 +278,12 @@
     const alvo = letra.toUpperCase();
     const { alts } = separarCards();
 
-    // 1) Tenta encontrar o card pela letra explícita na primeira linha
     const porLetra = alts.find(el => {
       const linhas = obterLinhasCard(el);
       return linhas.length > 0 && linhas[0].toUpperCase() === alvo;
     });
     if (porLetra && clicarReal(porLetra)) return true;
 
-    // 2) Fallback posicional (A=0 ... E=4)
     const idx = alvo.charCodeAt(0) - 65;
     if (idx >= 0 && idx < alts.length) {
       return clicarReal(alts[idx]);
@@ -230,18 +293,38 @@
   }
 
   async function aguardarFeedback() {
-    for (let i = 0; i < CONFIG.tentativas; i++) {
+    let clicouConfirmar = false;
+
+    for (let i = 0; i < CONFIG.tentativasFeedback; i++) {
       if (!estado.ativo) return false;
-      const btn = localizarBotao("Continuar") || localizarBotao("Finalizar");
-      if (btn && habilitado(btn)) return true;
+
+      const btnAvancar = localizarBotao("Continuar") || localizarBotao("Finalizar");
+      if (btnAvancar && habilitado(btnAvancar)) return true;
+
+      if (!clicouConfirmar) {
+        const btnConfirmar = localizarBotaoConfirmar();
+        if (btnConfirmar && habilitado(btnConfirmar)) {
+          log("Confirmando resposta...");
+          clicarReal(btnConfirmar);
+          clicouConfirmar = true;
+          await esperar(300);
+          continue;
+        }
+      }
+
       await esperar(CONFIG.intervalo);
     }
+
     return false;
   }
 
   function estaNoCurso() {
+    if (capturar()) return false;
+    const temBotaoContinuarOuFinalizar = Boolean(localizarBotao("Continuar") || localizarBotao("Finalizar"));
+    if (temBotaoContinuarOuFinalizar) return false;
+
     const texto = document.body.innerText || "";
-    return /UNIDADE\s+\d+/i.test(texto) && !capturar();
+    return /UNIDADE\s+\d+/i.test(texto);
   }
 
   function encontrarAtividadeDisponivel() {
@@ -268,6 +351,7 @@
         clicarReal(irAtividades);
         estado.ultimaAssinatura = "";
         estado.tentativasSemAtividade = 0;
+        salvarEstadoPersistido();
         await esperar(1100);
         return;
       }
@@ -279,6 +363,7 @@
         clicarReal(atividade);
         estado.ultimaAssinatura = "";
         estado.tentativasSemAtividade = 0;
+        salvarEstadoPersistido();
         await esperar(1100);
         return;
       }
@@ -293,7 +378,7 @@
         }
 
         estado.tentativasSemAtividade++;
-        if (estado.tentativasSemAtividade < 8) {
+        if (estado.tentativasSemAtividade < 12) {
           log("Procurando outras atividades...");
           await esperar(1400);
         } else {
@@ -318,7 +403,7 @@
     log("Finalizando atividade...");
     clicarReal(finalizar);
 
-    for (let i = 0; i < 60; i++) {
+    for (let i = 0; i < 80; i++) {
       if (!estado.ativo) return false;
       await esperar(450);
 
@@ -327,7 +412,7 @@
       ].find(el =>
         visivel(el) &&
         habilitado(el) &&
-        norm(el.textContent).toLowerCase() === "continuar" &&
+        norm(el.innerText || el.textContent).toLowerCase() === "continuar" &&
         (
           (el.getAttribute("href") || "").includes("/cursos/") ||
           (el.getAttribute("href") || "").includes("/courses/") ||
@@ -340,6 +425,7 @@
         clicarReal(continuar);
         estado.ultimaAssinatura = "";
         estado.tentativasSemAtividade = 0;
+        salvarEstadoPersistido();
         await esperar(CONFIG.intervaloEntreAtividades);
         return true;
       }
@@ -361,7 +447,7 @@
         log("Avançando questão...");
         clicarReal(continuar);
 
-        for (let i = 0; i < CONFIG.tentativas; i++) {
+        for (let i = 0; i < CONFIG.tentativasTransicao; i++) {
           if (!estado.ativo) return;
           await esperar(CONFIG.intervalo);
 
@@ -388,7 +474,7 @@
 
     if (!q) {
       await orquestrarCurso();
-      if (estado.ativo) agendar(200);
+      if (estado.ativo && !ocupado()) agendar(250);
       return;
     }
 
@@ -401,6 +487,7 @@
 
     estado.executando = true;
     estado.assinaturaEmAndamento = q.assinatura;
+    estado.tentativasSemAtividade = 0;
 
     try {
       log("Questão capturada.");
@@ -431,17 +518,17 @@
       }
 
       estado.ultimaAssinatura = q.assinatura;
+      salvarEstadoPersistido();
 
       await esperar(400);
       await avancar(q.assinatura);
-      if (estado.ativo) agendar(200);
     } catch (e) {
       err("Erro:", e?.message || e);
-      await esperar(2500);
-      if (estado.ativo) agendar(300);
+      await esperar(2000);
     } finally {
       estado.assinaturaEmAndamento = "";
       estado.executando = false;
+      if (estado.ativo) agendar(250);
     }
   }
 
@@ -462,6 +549,10 @@
     clearTimeout(estado.timer);
     estado.timer = null;
     estado.ativo = true;
+    estado.executando = false;
+    estado.avancando = false;
+    estado.navegando = false;
+    estado.assinaturaEmAndamento = "";
 
     estado.observer = new MutationObserver(() => {
       if (!ocupado()) {
@@ -488,6 +579,9 @@
       clearTimeout(estado.timer);
       estado.timer = null;
       estado.observer?.disconnect();
+      estado.executando = false;
+      estado.avancando = false;
+      estado.navegando = false;
       estado.assinaturaEmAndamento = "";
       log("Automação parada.");
     },
@@ -500,6 +594,7 @@
       estado.cacheRespostas.clear();
       estado.ultimaAssinatura = "";
       estado.assinaturaEmAndamento = "";
+      salvarEstadoPersistido();
       log("Cache limpo.");
     },
     setConfig: novas => {
